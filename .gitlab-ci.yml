@@ -1,0 +1,171 @@
+
+# This definition builds the container for WebGoat and uses SAST and SAST
+# SAST might pass with a failure because of a missing Webwolf part but it can be ignored
+# which would make a great use case why allowing failures can make sense
+# Two DAST approaches can be applied: AJAX spider or Browser based crawling
+# The latter is more efficient when it operates on WebGoat due to the way the WebGoat navigation is set up
+# The latter approach requires around 2h which is not unusual for some applications
+# AJAX spider only reveals a subset of findings
+# In this project the WebGoat container has been used as a service so we can avoid deployment
+# It is probably not the most efficient way but pretty good for this demo project.
+# There seems to be a silly bug that the variables part is not respected: ToDo
+
+stages:
+  - build
+  - analyze
+  - test
+  - push
+  - dast
+
+services:
+  - name: docker:dind
+    alias: dind
+
+
+
+  
+cache:
+  policy: pull
+  key: ${CI_COMMIT_SHA}
+  paths:
+  - .m2/
+
+variables:
+  CI_DEBUG_TRACE: "true"
+  SECURE_LOG_LEVEL: "debug" # pretty helpful when you get errors like exit 1
+
+ 
+
+build:
+  stage: build
+  image: maven:3-jdk-11-slim
+  script:
+    - mvn clean install -DskipTests=true # -DskipTests to shorten the build
+    - mvn package -DskipTests=true -Dmaven.repo.local=./.m2 # -DskipTests
+  cache:
+    policy: push
+    key: ${CI_COMMIT_SHA}
+    paths:
+      - .m2
+  artifacts:
+    paths:
+      - "webgoat-server/Dockerfile"
+      - "webgoat-server/target/webgoat-server-v8.1.0.jar"
+    reports:
+      junit:
+      - ./webgoat-integration-tests/target/surefire-reports/TEST-*.xml
+      - ./webwolf/target/surefire-reports/TEST-*.xml
+      - ./webgoat-container/target/surefire-reports/TEST-*.xml
+      - ./webgoat-lessons/jwt/target/surefire-reports/TEST-*.xml
+      - ./webgoat-lessons/bypass-restrictions/target/surefire-reports/TEST-*.xml
+      - ./webgoat-lessons/crypto/target/surefire-reports/TEST-*.xml
+      - ./webgoat-lessons/missing-function-ac/target/surefire-reports/TEST-*.xml
+      - ./webgoat-lessons/cross-site-scripting/target/surefire-reports/TEST-*.xml
+      - ./webgoat-lessons/xxe/target/surefire-reports/TEST-*.xml
+      - ./webgoat-lessons/insecure-deserialization/target/surefire-reports/TEST-*.xml
+      - ./webgoat-lessons/path-traversal/target/surefire-reports/TEST-*.xml
+      - ./webgoat-lessons/csrf/target/surefire-reports/TEST-*.xml      
+      - ./webgoat-lessons/chrome-dev-tools/target/surefire-reports/TEST-*.xml
+      - ./webgoat-lessons/vulnerable-components/target/surefire-reports/TEST-*.xml
+      - ./webgoat-lessons/challenge/target/surefire-reports/TEST-*.xml
+      - ./webgoat-lessons/http-proxies/target/surefire-reports/TEST-*.xml
+      - ./webgoat-lessons/cia/target/surefire-reports/TEST-*.xml
+      - ./webgoat-lessons/sql-injection/target/surefire-reports/TEST-*.xml
+      - ./webgoat-lessons/client-side-filtering/target/surefire-reports/TEST-*.xml
+
+
+include:
+  - template: SAST.gitlab-ci.yml
+  - template: DAST.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+  - template: Code-Quality.gitlab-ci.yml
+  - template: Security/License-Scanning.gitlab-ci.yml
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+
+
+# editor complaint is okay
+sast:
+  stage: analyze
+  artifacts:
+    reports:
+      sast: gl-sast-report.json
+    paths:
+      - .m2/
+      - target/
+      - gl-sast-report.json
+
+spotbugs-sast:
+  dependencies:
+    - build
+  script:
+    - asdf install java adoptopenjdk-11.0.14+9
+    - /analyzer run # -compile=false
+  variables:
+    CI_DEBUG_TRACE: "true"
+    MAVEN_REPO_PATH: ${CI_PROJECT_DIR}/.m2/
+    JAVA_HOME: "/usr/local/openjdk-11/"
+  artifacts:
+    reports:
+      sast: gl-sast-report.json
+    paths:
+      - gl-sast-report.json
+
+
+push:
+  services:
+  - name: docker:20.10.6-dind
+  image: docker:20.10.6
+  variables:
+    DOCKER_DRIVER: overlay2 # not sure this is needed
+  stage: push
+  needs: [build]
+  script:
+    - cd webgoat-server
+    - docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY
+    - docker pull $CI_REGISTRY_IMAGE:latest || true
+    - docker build --build-arg webgoat_version=v8.1.0 --tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA --tag $CI_REGISTRY_IMAGE:latest .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - docker push $CI_REGISTRY_IMAGE:latest
+
+# editor complains ?
+dast:
+  needs: [push]
+  variables:
+    DAST_WEBSITE: http://webgoat:8080/WebGoat/
+    DAST_AUTH_URL: http://webgoat:8080/WebGoat/login
+    DAST_EXCLUDE_URLS: http://webgoat:8080/WebGoat/logout,http://webgoat:8080/WebGoat/login,http://webgoat:8080/WebGoat/login?logout
+    DAST_FULL_SCAN_ENABLED: "true"
+    DAST_USERNAME: testtest
+    DAST_PASSWORD: password # use protected/masked variables, this is only for demonstration purposes
+    DAST_USERNAME_FIELD: username
+    DAST_PASSWORD_FIELD: password
+    DAST_AUTH_REPORT: "true"
+    DAST_AUTH_VERIFICATION_URL: "http://webgoat:8080/WebGoat/start.mvc#lesson/WebGoatIntroduction.lesson"
+    DAST_ZAP_USE_AJAX_SPIDER: "true"
+    DOCKER_DRIVER: overlay2
+  before_script:
+    # we need to add a user first in order to login
+    - curl -vvv -X POST -d "username=testtest&password=password&matchingPassword=password&agree=agree&submit=Submit" "http://webgoat:8080/WebGoat/register.mvc"   
+    # repeating variables here: see ToDo above
+    - export DAST_WEBSITE=http://webgoat:8080/WebGoat/ 
+    - export DAST_AUTH_URL=http://webgoat:8080/WebGoat/login
+    - export DAST_EXCLUDE_URLS=http://webgoat:8080/WebGoat/logout,http://webgoat:8080/WebGoat/login,http://webgoat:8080/WebGoat/login?logout
+    - export DAST_FULL_SCAN_ENABLED=true
+    - export DAST_USERNAME=testtest
+    - export DAST_PASSWORD=password # use protected/masked variables, this is only for demonstration purposes
+    - export DAST_USERNAME_FIELD=username
+    - export DAST_PASSWORD_FIELD=password
+    - export DAST_AUTH_REPORT=true
+    - export DAST_AUTH_VERIFICATION_URL="http://webgoat:8080/WebGoat/start.mvc#lesson/WebGoatIntroduction.lesson"
+    - export DAST_ZAP_USE_AJAX_SPIDER=true
+    #- export DAST_BROWSER_SCAN=true
+    #- export DAST_BROWSER_ACTION_TIMEOUT="30s"
+    #- DAST_BROWSER_NUMBER_OF_BROWSERS=3
+    - echo "In case of error you might want to set SECURE_LOG_LEVEL to a value of debug "
+  artifacts:
+    paths: [gl-dast-debug-auth-report.html]
+    when: always
+  services:
+  # WebGoat is only applied as a service here to avoid deployment for demo purposes  
+  - name: $CI_REGISTRY_IMAGE:latest
+    alias: webgoat
